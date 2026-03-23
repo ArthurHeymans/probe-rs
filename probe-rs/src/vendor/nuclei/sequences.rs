@@ -108,7 +108,7 @@ impl RiscvDebugSequence for NucleiSequence {
         //
         // MISA.MXL (bits [XLEN-1:XLEN-2]) indicates the native XLEN.
         // For RV64 the top two bits of the 64-bit MISA are 0b10.
-        if let Ok(misa) = interface.read_csr_progbuf_64(0x301) {
+        if let Ok(misa) = interface.read_csr_progbuf(0x301) {
             let mxl = misa >> 62;
             if mxl == 2 {
                 tracing::info!(
@@ -122,11 +122,11 @@ impl RiscvDebugSequence for NucleiSequence {
         }
 
         // Probe ILM and DLM base addresses for diagnostic logging.
-        if let Ok(milmb) = interface.read_csr_progbuf_64(0x7C0) {
+        if let Ok(milmb) = interface.read_csr_progbuf(0x7C0) {
             let ilm_base = milmb & !1u64;
             tracing::info!("NucleiSequence: ILM base (milmb) = {:#010x}", ilm_base);
         }
-        if let Ok(mdlmb) = interface.read_csr_progbuf_64(0x7C1) {
+        if let Ok(mdlmb) = interface.read_csr_progbuf(0x7C1) {
             let dlm_base = mdlmb & !1u64;
             tracing::info!("NucleiSequence: DLM base (mdlmb) = {:#010x}", dlm_base);
         }

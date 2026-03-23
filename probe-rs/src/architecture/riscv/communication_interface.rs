@@ -1344,8 +1344,6 @@ impl<'state> RiscvCommunicationInterface<'state> {
     /// When set, `halted_access` writes `dcsr.prv = M` after every internal
     /// halt so that program-buffer instructions use physical addresses
     /// regardless of the privilege level at which the hart was interrupted.
-    // Used by vendor sequences (e.g. Nuclei, SiFive) not yet in this branch.
-    #[expect(dead_code)]
     pub(crate) fn set_force_machine_mode_progbuf(&mut self, force: bool) {
         self.state.force_machine_mode_progbuf = force;
     }
@@ -2569,6 +2567,25 @@ impl<'state> RiscvCommunicationInterface<'state> {
     /// Returns a mutable reference to the memory access configuration.
     pub fn memory_access_config(&mut self) -> &mut MemoryAccessConfig {
         &mut self.state.memory_access_config
+    }
+
+    /// Clear the abstractauto register to disable any auto-execution,
+    /// clear cmderr, and invalidate the progbuf cache.
+    ///
+    /// This should be called during session setup to prevent stale autoexec
+    /// state from a previous crashed session from interfering.
+    pub fn clear_abstractauto(&mut self) {
+        if let Err(e) = self.write_dm_register(Abstractauto(0)) {
+            tracing::debug!("Failed to clear abstractauto: {:?}", e);
+        }
+        // Clear any cmderr that may have been caused by stale autoexec.
+        let mut abstractcs_clear = Abstractcs(0);
+        abstractcs_clear.set_cmderr(0x7);
+        if let Err(e) = self.write_dm_register(abstractcs_clear) {
+            tracing::debug!("Failed to clear abstractcs cmderr: {:?}", e);
+        }
+        // Invalidate the progbuf cache so the next operation fully rewrites it.
+        self.state.progbuf_cache = [0u32; 16];
     }
 }
 
