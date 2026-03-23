@@ -943,49 +943,35 @@ impl<'state> RiscvCommunicationInterface<'state> {
         // 0x90000000) may not be mapped or may be write-protected in the
         // supervisor page table.  Forcing prv = M gives direct physical access.
         //
-        // IMPORTANT: we use abstract register commands (not read_csr_progbuf*)
-        // because the progbuf variants call halted_access themselves, which
-        // would cause infinite mutual recursion.  Abstract commands operate
-        // directly on DMI without re-entering halted_access.
+        // IMPORTANT: we first try abstract register commands.  If they return
+        // NotSupported (e.g. FU740 DM has no abstract CSR support), fall back
+        // to an *inline* program-buffer CSR read that does NOT call
+        // halted_access (avoiding infinite recursion).  The inline approach
+        // saves/restores s0 via abstract GPR commands (which the DM does
+        // support) and uses csrr/csrw instructions in the program buffer.
         let saved_prv: Option<u32> = if self.state.force_machine_mode_progbuf {
-            const DCSR_REGNO: u16 = 0x7b0;
             const PRV_MASK: u32 = 0x3;
             const PRV_M: u32 = 0x3;
-            // Bit 15: ebreakm — when set, `ebreak` in M-mode enters debug mode
-            // rather than taking a normal M-mode exception.  Without this bit the
-            // implicit `ebreak` at the end of the program buffer exits debug mode
-            // and sets cmderr=4 (halt/resume).
             const EBREAKM: u32 = 1 << 15;
 
-            // Read DCSR via abstract command (safe: no halted_access recursion).
-            match self.abstract_cmd_register_read(DCSR_REGNO) {
+            // Try abstract command first, then progbuf fallback.
+            let dcsr_result = self.read_dcsr_inline();
+            match dcsr_result {
                 Ok(dcsr) => {
                     let prv = dcsr & PRV_MASK;
-                    tracing::debug!(
-                        "halted_access: DCSR read = {:#010x}, prv = {}, ebreakm = {}",
-                        dcsr,
-                        prv,
-                        (dcsr & EBREAKM) != 0
-                    );
-
-                    // Build the desired DCSR: prv=M, ebreakm=1.
                     let need_prv = prv != PRV_M;
                     let need_ebreakm = (dcsr & EBREAKM) == 0;
                     if need_prv || need_ebreakm {
                         let dcsr_new = (dcsr & !PRV_MASK & !EBREAKM) | PRV_M | EBREAKM;
-                        tracing::debug!(
-                            "halted_access: updating DCSR {:#010x} -> {:#010x} \
-                             (prv {} -> M, ebreakm {} -> 1)",
-                            dcsr,
-                            dcsr_new,
-                            prv,
-                            (dcsr & EBREAKM) != 0
+                        tracing::trace!(
+                            "halted_access: updating DCSR {:#010x} -> {:#010x}",
+                            dcsr, dcsr_new,
                         );
-                        if let Err(e) = self.abstract_cmd_register_write(DCSR_REGNO, dcsr_new) {
-                            tracing::warn!("halted_access: could not update DCSR: {:?}", e);
+                        if let Err(e) = self.write_dcsr_inline(dcsr_new) {
+                            tracing::warn!(
+                                "halted_access: could not update DCSR: {:?}", e
+                            );
                         }
-                    } else {
-                        tracing::debug!("halted_access: DCSR already M-mode + ebreakm");
                     }
                     Some(prv)
                 }
@@ -1001,18 +987,24 @@ impl<'state> RiscvCommunicationInterface<'state> {
         let result = op(self);
 
         // Restore the original dcsr.prv when it was not already M-mode.
-        // ebreakm is intentionally left set so that a resumed hart still
-        // returns to debug mode on ebreak; the normal halt/resume flow will
-        // eventually call debug_on_sw_breakpoint(false) at session close.
-        // Best-effort: ignore errors to not shadow the result of op().
+        // Note: ebreakm is intentionally left set — it must remain enabled
+        // for progbuf-based debug access to work on targets like FU740.
         if let Some(prv) = saved_prv {
-            const DCSR_REGNO: u16 = 0x7b0;
             const PRV_MASK: u32 = 0x3;
             const PRV_M: u32 = 0x3;
-            if prv != PRV_M
-                && let Ok(dcsr) = self.abstract_cmd_register_read(DCSR_REGNO)
-            {
-                let _ = self.abstract_cmd_register_write(DCSR_REGNO, (dcsr & !PRV_MASK) | prv);
+            if prv != PRV_M {
+                match self.read_dcsr_inline() {
+                    Ok(dcsr) => {
+                        let new_dcsr = (dcsr & !PRV_MASK) | prv;
+                        let _ = self.write_dcsr_inline(new_dcsr);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to restore dcsr.prv after halted_access: {e}. \
+                             Core may resume with incorrect privilege level."
+                        );
+                    }
+                }
             }
         }
 
@@ -1021,6 +1013,93 @@ impl<'state> RiscvCommunicationInterface<'state> {
         }
 
         result
+    }
+
+    /// Read DCSR without recursing into `halted_access`.
+    ///
+    /// Tries abstract CSR command first.  If that returns `NotSupported`
+    /// (e.g. FU740 DM), falls back to an inline program-buffer `csrr`
+    /// that saves/restores s0 via abstract GPR commands.
+    ///
+    /// DCSR is always 32 bits per the RISC-V Debug Spec regardless of XLEN.
+    fn read_dcsr_inline(&mut self) -> Result<u32, RiscvError> {
+        const DCSR_REGNO: u16 = 0x7b0;
+
+        // Try abstract CSR access first (cheapest path).
+        let abstract_result: Result<u32, RiscvError> = if self.state.xlen_64 {
+            self.abstract_cmd_register_read_64(DCSR_REGNO)
+                .map(|v| v as u32)
+        } else {
+            self.abstract_cmd_register_read(DCSR_REGNO)
+        };
+        match abstract_result {
+            Ok(v) => return Ok(v),
+            Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::NotSupported)) => {
+                // Fall through to program-buffer path.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Program-buffer fallback: csrr s0, dcsr; then read s0 via abstract GPR.
+        let csrr_cmd = assembly::csrr(8, DCSR_REGNO);
+        self.schedule_setup_program_buffer(&[csrr_cmd])?;
+
+        let mut postexec_cmd = AccessRegisterCommand(0);
+        postexec_cmd.set_postexec(true);
+
+        if self.state.xlen_64 {
+            let s0_saved = self.save_s0_64()?;
+            self.execute_abstract_command(postexec_cmd.0)?;
+            let dcsr_val = self.abstract_cmd_register_read_64(&registers::S0)
+                .map(|v| v as u32)?;
+            self.restore_s0_64(s0_saved)?;
+            Ok(dcsr_val)
+        } else {
+            let s0_saved = self.save_s0()?;
+            self.execute_abstract_command(postexec_cmd.0)?;
+            let dcsr_val = self.abstract_cmd_register_read(&registers::S0)?;
+            self.restore_s0(s0_saved)?;
+            Ok(dcsr_val)
+        }
+    }
+
+    /// Write DCSR without recursing into `halted_access`.
+    ///
+    /// Same strategy as [`read_dcsr_inline`]: abstract first, then inline progbuf.
+    fn write_dcsr_inline(&mut self, value: u32) -> Result<(), RiscvError> {
+        const DCSR_REGNO: u16 = 0x7b0;
+
+        let abstract_result = if self.state.xlen_64 {
+            self.abstract_cmd_register_write_64(DCSR_REGNO, value as u64)
+        } else {
+            self.abstract_cmd_register_write(DCSR_REGNO, value)
+        };
+        match abstract_result {
+            Ok(()) => return Ok(()),
+            Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::NotSupported)) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Program-buffer fallback: write value to s0, then csrw dcsr, s0.
+        let csrw_cmd = assembly::csrw(DCSR_REGNO, 8);
+        self.schedule_setup_program_buffer(&[csrw_cmd])?;
+
+        let mut postexec_cmd = AccessRegisterCommand(0);
+        postexec_cmd.set_postexec(true);
+
+        if self.state.xlen_64 {
+            let s0_saved = self.save_s0_64()?;
+            self.abstract_cmd_register_write_64(&registers::S0, value as u64)?;
+            self.execute_abstract_command(postexec_cmd.0)?;
+            self.restore_s0_64(s0_saved)?;
+        } else {
+            let s0_saved = self.save_s0()?;
+            self.abstract_cmd_register_write(&registers::S0, value)?;
+            self.execute_abstract_command(postexec_cmd.0)?;
+            self.restore_s0(s0_saved)?;
+        }
+
+        Ok(())
     }
 
     pub(super) fn read_csr(&mut self, address: u16) -> Result<u32, RiscvError> {
@@ -1511,7 +1590,7 @@ impl<'state> RiscvCommunicationInterface<'state> {
             let s0 = core.save_s0()?;
             let s1 = core.save_s1()?;
 
-            // Load a word from address in register 8 (S0), with offset 0, into register 9 (S9)
+            // Program buffer: load word from [s0] into s1, then increment s0.
             let lw_command: u32 = assembly::lw(0, 8, V::WIDTH as u8, 9);
 
             core.schedule_setup_program_buffer(&[
@@ -1519,85 +1598,87 @@ impl<'state> RiscvCommunicationInterface<'state> {
                 assembly::addi(8, 8, V::WIDTH.byte_width() as i16),
             ])?;
 
-            // On RV64, use a 64-bit abstract register write to load the address
-            // into S0 to avoid sign-extension of addresses with bit 31 set.
-            if core.state.xlen_64 {
-                core.abstract_cmd_register_write_64(&registers::S0, u64::from(address))?;
-
-                // Execute program buffer (lw from [s0], addi s0).
-                let mut command = AccessRegisterCommand(0);
-                command.set_cmd_type(0);
-                command.set_transfer(false);
-                command.set_postexec(true);
-                command.set_regno((registers::S0).id.0 as u32);
-                core.schedule_write_dm_register(command)?;
-            } else {
-                core.schedule_write_dm_register(Data0(address))?;
-
-                // Write s0, then execute program buffer
-                let mut command = AccessRegisterCommand(0);
-                command.set_cmd_type(0);
-                command.set_transfer(true);
-                command.set_write(true);
-
-                // registers are 32 bit, so we have size 2 here
-                command.set_aarsize(RiscvBusAccess::A32);
-                command.set_postexec(true);
-
-                // register s0, ie. 0x1008
-                command.set_regno((registers::S0).id.0 as u32);
-
-                core.schedule_write_dm_register(command)?;
-            }
-
-            if wait_for_idle {
-                core.wait_for_idle(Duration::from_millis(10))?;
-            }
-
             let data_len = data.len();
 
-            let mut result_idxs = Vec::with_capacity(data_len - 1);
-            for out_idx in 0..data_len - 1 {
-                let mut command = AccessRegisterCommand(0);
-                command.set_cmd_type(0);
-                command.set_transfer(true);
-                command.set_write(false);
+            // Inner closure captures errors from the read logic.  The `?`
+            // operator returns from this inner closure (not the outer
+            // halted_access closure), so the unconditional cleanup below
+            // always runs regardless of success or failure.
+            let read_result: Result<(), RiscvError> = (|| {
+                    // Write address to S0 and execute first progbuf iteration.
+                    if core.state.xlen_64 {
+                        core.abstract_cmd_register_write_64(
+                            &registers::S0,
+                            u64::from(address),
+                        )?;
 
-                // registers are 32 bit, so we have size 2 here
-                command.set_aarsize(RiscvBusAccess::A32);
-                command.set_postexec(true);
+                        let mut command = AccessRegisterCommand(0);
+                        command.set_cmd_type(0);
+                        command.set_transfer(false);
+                        command.set_postexec(true);
+                        command.set_regno((registers::S0).id.0 as u32);
+                        core.schedule_write_dm_register(command)?;
+                    } else {
+                        core.schedule_write_dm_register(Data0(address))?;
 
-                command.set_regno((registers::S1).id.0 as u32);
+                        let mut command = AccessRegisterCommand(0);
+                        command.set_cmd_type(0);
+                        command.set_transfer(true);
+                        command.set_write(true);
+                        command.set_aarsize(RiscvBusAccess::A32);
+                        command.set_postexec(true);
+                        command.set_regno((registers::S0).id.0 as u32);
+                        core.schedule_write_dm_register(command)?;
+                    }
 
-                core.schedule_write_dm_register(command)?;
+                    if wait_for_idle {
+                        core.wait_for_idle(Duration::from_millis(10))?;
+                    }
 
-                // Read back s1
-                let value_idx = core.schedule_read_dm_register::<Data0>()?;
+                    // Read all but last word via COMMAND + DATA0 per word.
+                    let mut result_idxs = Vec::with_capacity(data_len - 1);
+                    for out_idx in 0..data_len - 1 {
+                        let mut command = AccessRegisterCommand(0);
+                        command.set_cmd_type(0);
+                        command.set_transfer(true);
+                        command.set_write(false);
+                        command.set_aarsize(RiscvBusAccess::A32);
+                        command.set_postexec(true);
+                        command.set_regno((registers::S1).id.0 as u32);
 
-                result_idxs.push((out_idx, value_idx));
+                        core.schedule_write_dm_register(command)?;
+                        let value_idx = core.schedule_read_dm_register::<Data0>()?;
+                        result_idxs.push((out_idx, value_idx));
 
-                if wait_for_idle {
-                    core.wait_for_idle(Duration::from_millis(10))?;
-                }
-            }
+                        if wait_for_idle {
+                            core.wait_for_idle(Duration::from_millis(10))?;
+                        }
+                    }
 
-            // Now read the last value. This will also reset `postexec` to false, so we don't have to wait for the program buffer to execute.
-            let last_value = core.abstract_cmd_register_read(&registers::S1)?;
-            data[data.len() - 1] = V::from_register_value(last_value);
+                    let last_value = core.abstract_cmd_register_read(&registers::S1)?;
+                    data[data.len() - 1] = V::from_register_value(last_value);
 
-            for (out_idx, value_idx) in result_idxs {
-                let value = core.dtm.read_deferred_result(value_idx)?.into_u32();
+                    for (out_idx, value_idx) in result_idxs {
+                        let value = core.dtm.read_deferred_result(value_idx)?.into_u32();
+                        data[out_idx] = V::from_register_value(value);
+                    }
 
-                data[out_idx] = V::from_register_value(value);
-            }
+                Ok(())
+            })();
 
-            let status: Abstractcs = core.read_dm_register()?;
-            AbstractCommandErrorKind::parse(status)?;
+            // Unconditional cleanup: ensure autoexec is disabled, cmderr is
+            // cleared, progbuf cache is invalidated, and registers are
+            // restored.  Best-effort (ignore errors) to avoid shadowing
+            // read_result.
+            let _ = core.write_dm_register(Abstractauto(0));
+            let mut cs_clear = Abstractcs(0);
+            cs_clear.set_cmderr(0x7);
+            let _ = core.write_dm_register(cs_clear);
+            core.state.progbuf_cache = [0u32; 16];
+            let _ = core.restore_s0(s0);
+            let _ = core.restore_s1(s1);
 
-            core.restore_s0(s0)?;
-            core.restore_s1(s1)?;
-
-            Ok(())
+            read_result
         })
     }
 
@@ -2365,35 +2446,28 @@ impl<'state> RiscvCommunicationInterface<'state> {
     }
 
     fn debug_on_sw_breakpoint(&mut self, enabled: bool) -> Result<(), RiscvError> {
-        let raw = self.read_csr(0x7b0)?;
+        const DCSR: u16 = 0x7b0;
+
+        let raw = self.read_csr(DCSR)?;
         let mut dcsr = Dcsr(raw);
         tracing::debug!(
-            "debug_on_sw_breakpoint({}): DCSR before = {:#010x}",
-            enabled,
-            raw
+            "debug_on_sw_breakpoint({enabled}): DCSR = {:#010x}", raw
         );
 
         dcsr.set_ebreakm(enabled);
         dcsr.set_ebreaks(enabled);
         dcsr.set_ebreaku(enabled);
 
-        tracing::debug!(
-            "debug_on_sw_breakpoint({}): DCSR to write = {:#010x}",
-            enabled,
-            dcsr.0
-        );
-
-        match self.abstract_cmd_register_write(0x7b0, dcsr.0) {
+        match self.abstract_cmd_register_write(DCSR, dcsr.0) {
             Ok(()) => {
                 self.state.sw_breakpoint_debug_enabled = enabled;
                 Ok(())
             }
             Err(RiscvError::AbstractCommand(AbstractCommandErrorKind::NotSupported)) => {
                 tracing::debug!(
-                    "Could not write core register {:#x} with abstract command, falling back to program buffer",
-                    0x7b0
+                    "Abstract CSR write not supported for DCSR, using progbuf"
                 );
-                self.write_csr_progbuf(0x7b0, dcsr.0)
+                self.write_csr_progbuf(DCSR, dcsr.0)
             }
             other => other,
         }
@@ -2402,6 +2476,25 @@ impl<'state> RiscvCommunicationInterface<'state> {
     /// Returns a mutable reference to the memory access configuration.
     pub fn memory_access_config(&mut self) -> &mut MemoryAccessConfig {
         &mut self.state.memory_access_config
+    }
+
+    /// Clear the abstractauto register to disable any auto-execution,
+    /// clear cmderr, and invalidate the progbuf cache.
+    ///
+    /// This should be called during session setup to prevent stale autoexec
+    /// state from a previous crashed session from interfering.
+    pub fn clear_abstractauto(&mut self) {
+        if let Err(e) = self.write_dm_register(Abstractauto(0)) {
+            tracing::debug!("Failed to clear abstractauto: {:?}", e);
+        }
+        // Clear any cmderr that may have been caused by stale autoexec.
+        let mut abstractcs_clear = Abstractcs(0);
+        abstractcs_clear.set_cmderr(0x7);
+        if let Err(e) = self.write_dm_register(abstractcs_clear) {
+            tracing::debug!("Failed to clear abstractcs cmderr: {:?}", e);
+        }
+        // Invalidate the progbuf cache so the next operation fully rewrites it.
+        self.state.progbuf_cache = [0u32; 16];
     }
 }
 

@@ -1207,6 +1207,10 @@ impl CoreInterface for Riscv64<'_> {
         CoreType::Riscv64
     }
 
+    fn is_64_bit(&self) -> bool {
+        true
+    }
+
     fn instruction_set(&mut self) -> Result<InstructionSet, Error> {
         let misa_val = self.read_csr(0x301)?;
         // Check bit 2 (C extension = compressed instructions)
